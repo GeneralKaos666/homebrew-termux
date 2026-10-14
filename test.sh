@@ -10,6 +10,9 @@ export HOMEBREW_GIT=/data/data/com.termux/files/usr/bin/git
 export HOMEBREW_TEMP="${HOME}/tmp"
 export HOMEBREW_DEFAULT_TEMP="${HOME}/tmp"
 mkdir -p "$HOMEBREW_TEMP"
+# Linked binaries (hello) are run by bare name below, so put the install's
+# bin directory on PATH regardless of how this shell was started.
+export PATH="${HOME}/brew/bin:${PATH}"
 
 PASS=0
 FAIL=0

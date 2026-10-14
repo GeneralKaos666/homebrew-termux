@@ -1,0 +1,346 @@
+diff --git a/Library/Homebrew/bottle_specification.rb b/Library/Homebrew/bottle_specification.rb
+index d95fa18..225c0a2 100644
+--- a/Library/Homebrew/bottle_specification.rb
++++ b/Library/Homebrew/bottle_specification.rb
+@@ -100,7 +100,12 @@ class BottleSpecification
+     prefix = Pathname(cellar.to_s).parent.to_s
+ 
+     # Raw prefix strings are patched in place, so the byte length decides.
+-    relocatable = !Homebrew::EnvConfig.no_relocate_build_prefix?
++    # homebrew-termux: Termux's prefix is always longer than the 26-byte
++    # /home/linuxbrew/.linuxbrew that Linux bottles are built at. Placeholdered
++    # text and RPATH/interpreter relocation is length independent, and the
++    # build-prefix C-string relocation skipped on Termux would fail at a longer
++    # prefix anyway, so accept the bottle instead of forcing a source build.
++    relocatable = Homebrew.termux? || !Homebrew::EnvConfig.no_relocate_build_prefix?
+     cellar_relocatable = relocatable && cellar.to_s.bytesize >= HOMEBREW_CELLAR.to_s.bytesize
+     prefix_relocatable = relocatable && prefix.bytesize >= HOMEBREW_PREFIX.to_s.bytesize
+ 
+diff --git a/Library/Homebrew/cmd/update-reset.sh b/Library/Homebrew/cmd/update-reset.sh
+index e6f265f..cad18e5 100644
+--- a/Library/Homebrew/cmd/update-reset.sh
++++ b/Library/Homebrew/cmd/update-reset.sh
+@@ -95,6 +95,24 @@ homebrew-update-reset() {
+       git -C "${DIR}" checkout --force -B "${head}" origin/HEAD
+     fi
+     rm -rf "${DIR}/.git/describe-cache"
++    # homebrew-termux: this command force-checks-out upstream over the Termux
++    # compat patches, and its git wrapper disables hooks, so nothing re-applies
++    # them on the way out. Without this the repository is left unpatched and
++    # bin/brew's patched shebang is gone. The tooling path is recorded in the
++    # checkout's local git config (see apply-patches.sh) and lives outside the
++    # tree, so it survives the reset.
++    if [[ "${DIR}" == "${HOMEBREW_REPOSITORY}" && -d "/data/data/com.termux/files/usr/glibc" ]]
++    then
++      local termux_apply_patches
++      termux_apply_patches="$(git -C "${DIR}" config --local --get homebrew-termux.applypatches 2>/dev/null)"
++      [[ -n "${termux_apply_patches}" ]] ||
++        termux_apply_patches="${HOME}/.homebrew/homebrew-termux/apply-patches.sh"
++      if [[ -x "${termux_apply_patches}" ]]
++      then
++        bash "${termux_apply_patches}" "${DIR}" --commit ||
++          opoo "Could not re-apply the Termux compat patches; re-run install.sh."
++      fi
++    fi
+     echo
+   done
+ }
+diff --git a/Library/Homebrew/cmd/vendor-install.sh b/Library/Homebrew/cmd/vendor-install.sh
+index dd98fc0..6a30b6b 100644
+--- a/Library/Homebrew/cmd/vendor-install.sh
++++ b/Library/Homebrew/cmd/vendor-install.sh
+@@ -90,7 +90,7 @@ check_linux_glibc_version() {
+   local minimum_required_major="${HOMEBREW_LINUX_MINIMUM_GLIBC_VERSION%.*}"
+   local minimum_required_minor="${HOMEBREW_LINUX_MINIMUM_GLIBC_VERSION#*.}"
+ 
+-  if [[ "$(/usr/bin/ldd --version)" =~ \ [0-9]\.[0-9]+ ]]
++  if [[ "$(/data/data/com.termux/files/usr/glibc/bin/ldd --version)" =~ \ [0-9]\.[0-9]+ ]]
+   then
+     glibc_version="${BASH_REMATCH[0]// /}"
+     glibc_version_major="${glibc_version%.*}"
+diff --git a/Library/Homebrew/formula.rb b/Library/Homebrew/formula.rb
+index 23f2357..7a12ab0 100644
+--- a/Library/Homebrew/formula.rb
++++ b/Library/Homebrew/formula.rb
+@@ -3701,11 +3701,9 @@ class Formula
+       if verbose?
+         rd, wr = IO.pipe
+         begin
+-          pid = fork do
+-            rd.close
+-            log.close
+-            exec_cmd(cmd, args, wr, log_filename)
+-          end
++          # homebrew-termux: use Process.spawn instead of fork. Android's kernel
++          # blocks pthread_rwlock_unlock in forked children, which crashes brew.
++          pid = Process.spawn(cmd, *args.map(&:to_s), out: wr, err: wr)
+           wr.close
+ 
+           if verbose_using_dots
+@@ -3730,9 +3728,8 @@ class Formula
+           rd.close
+         end
+       else
+-        pid = fork do
+-          exec_cmd(cmd, args, log, log_filename)
+-        end
++        # homebrew-termux: use Process.spawn instead of fork (see above).
++        pid = Process.spawn(cmd, *args.map(&:to_s), out: log, err: log)
+       end
+ 
+       Process.wait(pid)
+diff --git a/Library/Homebrew/global.rb b/Library/Homebrew/global.rb
+index 5a8b001..93f7dcb 100644
+--- a/Library/Homebrew/global.rb
++++ b/Library/Homebrew/global.rb
+@@ -66,6 +66,10 @@ module Homebrew
+   LINUX_X86_64_BOTTLE_PREFIX = T.let("/home/linuxbrew/.linuxbrew/.brew-padded-x86_64".ljust(64, "_").freeze, String)
+ 
+   class << self
++    sig { returns(T::Boolean) }
++    def termux?
++      @termux ||= T.let(File.directory?("/data/data/com.termux/files/usr"), T.nilable(T::Boolean))
++    end
+     sig { params(failed: T::Boolean).returns(T::Boolean) }
+     attr_writer :failed
+ 
+diff --git a/Library/Homebrew/list.sh b/Library/Homebrew/list.sh
+index 6a2aaeb..316b8e0 100644
+--- a/Library/Homebrew/list.sh
++++ b/Library/Homebrew/list.sh
+@@ -2,6 +2,12 @@
+ # HOMEBREW_CELLAR, HOMEBREW_PREFIX are set by brew.sh
+ # shellcheck disable=SC2154
+ homebrew-list() {
++
++  # homebrew-termux: use $PREFIX/bin/env
++  local env_cmd="/usr/bin/env"
++  if [[ -d "/data/data/com.termux/files/usr" ]]; then
++    env_cmd="/data/data/com.termux/files/usr/bin/env"
++  fi
+   case "$1" in
+     # check we actually have list and not e.g. listsomething
+     list | ls) ;;
+@@ -227,7 +233,7 @@ homebrew-list() {
+   if [[ -z "${cask}" && -d "${HOMEBREW_CELLAR}" ]]
+   then
+     local formula_output
+-    formula_output="$(/usr/bin/env "${ls_env[@]}" ls "${ls_args[@]}" "${HOMEBREW_CELLAR}")" || exit 1
++    formula_output="$(${env_cmd} "${ls_env[@]}" ls "${ls_args[@]}" "${HOMEBREW_CELLAR}")" || exit 1
+     if [[ -n "${formula_output}" ]]
+     then
+       if [[ -n "${tty}" && -z "${formula}" ]]
+@@ -247,7 +253,7 @@ homebrew-list() {
+   if [[ -z "${formula}" && -d "${HOMEBREW_CASKROOM}" ]]
+   then
+     local cask_output
+-    cask_output="$(/usr/bin/env "${ls_env[@]}" ls "${ls_args[@]}" "${HOMEBREW_CASKROOM}")" || exit 1
++    cask_output="$(${env_cmd} "${ls_env[@]}" ls "${ls_args[@]}" "${HOMEBREW_CASKROOM}")" || exit 1
+     if [[ -n "${cask_output}" ]]
+     then
+       if [[ -n "${tty}" && -z "${cask}" ]]
+diff --git a/Library/Homebrew/os/linux/glibc.rb b/Library/Homebrew/os/linux/glibc.rb
+index 2a60c93..1d2ccac 100644
+--- a/Library/Homebrew/os/linux/glibc.rb
++++ b/Library/Homebrew/os/linux/glibc.rb
+@@ -11,7 +11,7 @@ module OS
+       def system_version
+         @system_version ||= T.let(nil, T.nilable(Version))
+         @system_version ||= begin
+-          version = Utils.popen_read("/usr/bin/ldd", "--version")[/ (\d+\.\d+)/, 1]
++          version = Utils.popen_read("/data/data/com.termux/files/usr/glibc/bin/ldd", "--version")[/ (\d+\.\d+)/, 1]
+           if version
+             Version.new version
+           else
+@@ -24,7 +24,7 @@ module OS
+       def version
+         @version ||= T.let(nil, T.nilable(Version))
+         @version ||= begin
+-          version = Utils.popen_read(HOMEBREW_PREFIX/"opt/glibc/bin/ldd", "--version")[/ (\d+\.\d+)/, 1]
++          version = Utils.popen_read("/data/data/com.termux/files/usr/glibc/bin/ldd", "--version")[/ (\d+\.\d+)/, 1]
+           if version
+             Version.new version
+           else
+diff --git a/Library/Homebrew/os/linux/ld.rb b/Library/Homebrew/os/linux/ld.rb
+index 5bb1518..ba2672f 100644
+--- a/Library/Homebrew/os/linux/ld.rb
++++ b/Library/Homebrew/os/linux/ld.rb
+@@ -11,16 +11,22 @@ module OS
+       # glibc is new enough. Brew will fail to create a symlink for ld.so if
+       # the host architecture's linker cannot be found in this list.
+       DYNAMIC_LINKERS = T.let({
++        # homebrew-termux: Termux keeps its glibc in $PREFIX/glibc and its
++        # only /system linker is Bionic, which cannot load glibc binaries.
++        # Prefer the glibc bridge over /system/bin/linker*.
+         arm:     %w[
++          /data/data/com.termux/files/usr/glibc/lib/ld-linux.so.3
+           /lib/ld-linux.so.3
+           /lib/ld-linux-armhf.so.3
+           /system/bin/linker
+         ].freeze,
+         arm64:   %w[
++          /data/data/com.termux/files/usr/glibc/lib/ld-linux-aarch64.so.1
+           /lib/ld-linux-aarch64.so.1
+           /system/bin/linker64
+         ].freeze,
+         i386:    %w[
++          /data/data/com.termux/files/usr/glibc/lib/ld-linux.so.2
+           /lib/ld-linux.so.2
+           /system/bin/linker
+         ].freeze,
+diff --git a/Library/Homebrew/shims/shared/curl b/Library/Homebrew/shims/shared/curl
+index 434664e..3a4bed8 100755
+--- a/Library/Homebrew/shims/shared/curl
++++ b/Library/Homebrew/shims/shared/curl
+@@ -1,4 +1,4 @@
+-#!/bin/bash -p
++#!/data/data/com.termux/files/usr/glibc/bin/bash -p
+ 
+ # Make our $HOMEBREW_CURL selection universal - including in formulae usage.
+ 
+diff --git a/Library/Homebrew/shims/shared/git b/Library/Homebrew/shims/shared/git
+index 9f3a9b4..88d9797 100755
+--- a/Library/Homebrew/shims/shared/git
++++ b/Library/Homebrew/shims/shared/git
+@@ -1,4 +1,4 @@
+-#!/bin/bash -p
++#!/data/data/com.termux/files/usr/glibc/bin/bash -p
+ 
+ # This script exists because we support $HOMEBREW_GIT, $HOMEBREW_SVN etc., and Xcode-only
+ # or no Xcode/CLT configurations. Order is careful to be what the user would want.
+diff --git a/Library/Homebrew/system_command.rb b/Library/Homebrew/system_command.rb
+index 7ba3921..c2a3233 100644
+--- a/Library/Homebrew/system_command.rb
++++ b/Library/Homebrew/system_command.rb
+@@ -433,7 +433,7 @@ class SystemCommand
+ 
+   sig { returns(T::Array[String]) }
+   def env_prefix
+-    ["/usr/bin/env", *env_args]
++    ["/data/data/com.termux/files/usr/bin/env", *env_args]
+   end
+ 
+   sig { returns(T::Array[String]) }
+diff --git a/Library/Homebrew/unpack_strategy/tar.rb b/Library/Homebrew/unpack_strategy/tar.rb
+index 91254f4..0a59f3c 100644
+--- a/Library/Homebrew/unpack_strategy/tar.rb
++++ b/Library/Homebrew/unpack_strategy/tar.rb
+@@ -48,7 +48,15 @@ module UnpackStrategy
+           path
+         end
+ 
+-        system_command! "tar",
++        # homebrew-termux: Android's FUSE filesystem cannot create hard links,
++        # so route tar through a wrapper that tolerates the failure.
++        tar_cmd = if Homebrew.termux? && File.exist?("/data/data/com.termux/files/usr/bin/brew-tar")
++          "/data/data/com.termux/files/usr/bin/brew-tar"
++        else
++          "tar"
++        end
++
++        system_command! tar_cmd,
+                         args:    ["--extract", "--no-same-owner",
+                                   "--file", tar_path,
+                                   "--directory", unpack_dir],
+diff --git a/Library/Homebrew/utils/executables.sh b/Library/Homebrew/utils/executables.sh
+index 464a05b..7f5a16f 100644
+--- a/Library/Homebrew/utils/executables.sh
++++ b/Library/Homebrew/utils/executables.sh
+@@ -22,7 +22,7 @@ executables_file_fresh() {
+     stat_printf=("/usr/bin/stat" "-f")
+     stat_format="%m"
+   else
+-    stat_printf=("/usr/bin/stat" "-c")
++    stat_printf=("/data/data/com.termux/files/usr/bin/stat" "-c")
+     stat_format="%Y"
+   fi
+ 
+diff --git a/Library/Homebrew/utils/os.sh b/Library/Homebrew/utils/os.sh
+index 9bdb7ed..c82971c 100644
+--- a/Library/Homebrew/utils/os.sh
++++ b/Library/Homebrew/utils/os.sh
+@@ -34,6 +34,12 @@ case "${OSTYPE}" in
+ esac
+ HOMEBREW_PHYSICAL_PROCESSOR="${HOMEBREW_PROCESSOR}"
+ 
++# homebrew-termux detection
++if [[ -d "/data/data/com.termux/files/usr" ]]; then
++  HOMEBREW_TERMUX=1
++  export HOMEBREW_TERMUX
++fi
++
+ HOMEBREW_MACOS_ARM_DEFAULT_PREFIX="/opt/homebrew"
+ HOMEBREW_LINUX_DEFAULT_PREFIX="/home/linuxbrew/.linuxbrew"
+ HOMEBREW_GENERIC_DEFAULT_PREFIX="/usr/local"
+@@ -59,7 +65,11 @@ else
+   CACHE_HOME="${HOMEBREW_XDG_CACHE_HOME:-${HOME}/.cache}"
+   HOMEBREW_DEFAULT_CACHE="${CACHE_HOME}/Homebrew"
+   HOMEBREW_DEFAULT_LOGS="${CACHE_HOME}/Homebrew/Logs"
+-  if [[ -r "/var/tmp" && -w "/var/tmp" ]]
++  if [[ -n "${HOMEBREW_TERMUX}" ]]
++  then
++    # homebrew-termux: Android has no writable /tmp or /var/tmp.
++    HOMEBREW_DEFAULT_TEMP="/data/data/com.termux/files/usr/tmp"
++  elif [[ -r "/var/tmp" && -w "/var/tmp" ]]
+   then
+     HOMEBREW_DEFAULT_TEMP="/var/tmp"
+   else
+@@ -120,7 +130,8 @@ setup-locale() {
+   else
+     if ! command -v locale >/dev/null
+     then
+-      export LC_ALL=C
++      # homebrew-termux: force UTF-8 (no locales installed)
++      export LC_ALL=C.UTF-8
+     elif [[ "$(locale charmap)" != "UTF-8" ]]
+     then
+       locales="$(locale -a)"
+@@ -183,7 +194,11 @@ setup-os-details() {
+     HOMEBREW_PRODUCT="${HOMEBREW_SYSTEM}brew"
+     # Don't try to follow /etc/os-release
+     # shellcheck disable=SC1091
+-    [[ -n "${HOMEBREW_LINUX}" ]] && HOMEBREW_OS_VERSION="$(source /etc/os-release && echo "${PRETTY_NAME}")"
++    if [[ -d "/data/data/com.termux/files/usr" ]]; then
++      HOMEBREW_OS_VERSION="Termux (Android)"
++    else
++      HOMEBREW_OS_VERSION="$(source /etc/os-release && echo "${PRETTY_NAME}")"
++    fi
+     : "${HOMEBREW_OS_VERSION:=$(uname -r)}"
+     HOMEBREW_OS_USER_AGENT_VERSION="${HOMEBREW_OS_VERSION}"
+ 
+diff --git a/Library/Homebrew/utils/popen.rb b/Library/Homebrew/utils/popen.rb
+index fa986bf..06e583e 100644
+--- a/Library/Homebrew/utils/popen.rb
++++ b/Library/Homebrew/utils/popen.rb
+@@ -102,7 +102,8 @@ module Utils
+   def self.popen(args, mode, options = {}, &_block)
+     # `brew prof --vernier` uses this to avoid inheriting Vernier's active
+     # native collector state through `IO.popen("-")` fork paths.
+-    if ENV["HOMEBREW_SPAWN_SYSTEM"] == "1"
++    # homebrew-termux: avoid fork (pthread crash on Android)
++    if Homebrew.termux? || ENV["HOMEBREW_SPAWN_SYSTEM"] == "1"
+       options[:err] = [:child, :out] if options[:err] == :out
+       options[:err] ||= File::NULL unless ENV["HOMEBREW_STDERR"]
+       IO.popen(args, mode, options.merge(pgroup: true)) do |pipe|
+diff --git a/Library/Homebrew/utils/tty.rb b/Library/Homebrew/utils/tty.rb
+index 8ac7800..d289c33 100644
+--- a/Library/Homebrew/utils/tty.rb
++++ b/Library/Homebrew/utils/tty.rb
+@@ -150,7 +150,7 @@ module Tty
+     sig { returns(Integer) }
+     def height
+       @height ||= T.let(
+-        size&.first || Utils.popen_read_text("/usr/bin/tput", "lines", err: File::NULL).presence&.to_i || 40,
++        size&.first || Utils.popen_read_text("/data/data/com.termux/files/usr/bin/tput", "lines", err: File::NULL).presence&.to_i || 40,
+         T.nilable(Integer),
+       )
+     end
+@@ -159,7 +159,7 @@ module Tty
+     sig { returns(Integer) }
+     def width
+       @width ||= T.let(
+-        size&.second || Utils.popen_read_text("/usr/bin/tput", "cols", err: File::NULL).presence&.to_i || 80,
++        size&.second || Utils.popen_read_text("/data/data/com.termux/files/usr/bin/tput", "cols", err: File::NULL).presence&.to_i || 80,
+         T.nilable(Integer),
+       )
+     end

@@ -3,20 +3,26 @@
 # Usage: bash install.sh
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ─── Configuration ──────────────────────────────────────────────────────────
-BREW_DIR="${HOME}/brew"
-CACHE_DIR="${HOME}/.cache/Homebrew"
-TMP_DIR="${HOME}/tmp"
-PREFIX="/data/data/com.termux/files/usr"
-GLIBC_PREFIX="${PREFIX}/glibc"
+# shellcheck source=config.sh
+[[ -f "${SCRIPT_DIR}/config.sh" ]] && source "${SCRIPT_DIR}/config.sh"
+
+PREFIX="${TERMUX_PREFIX:-/data/data/com.termux/files/usr}"
+GLIBC_PREFIX="${TERMUX_GLIBC_PREFIX:-${PREFIX}/glibc}"
+GLIBC_BASH="${TERMUX_GLIBC_BASH}"
+GLIBC_LD="${TERMUX_GLIBC_LD}"
 GIT="${PREFIX}/bin/git"
-RUBY="${PREFIX}/bin/ruby"
+RUBY="${TERMUX_RUBY_BIN:-${PREFIX}/bin/ruby}"
 CURL="${PREFIX}/bin/curl"
-PATCHELF="${GLIBC_PREFIX}/bin/patchelf"
-GLIBC_LD="${GLIBC_PREFIX}/lib/ld-linux-aarch64.so.1"
-GLIBC_LIB="${GLIBC_PREFIX}/lib"
-GLIBC_BASH="${GLIBC_PREFIX}/bin/bash"
-ENV_BIN="${GLIBC_PREFIX}/bin/env"
+BREW_DIR="${BREW_DIR:-${HOME}/brew}"
+REPO_DIR="${TERMUX_REPO_DIR:-${HOME}/.homebrew/homebrew-termux}"
+TMP_DIR="${PREFIX}/tmp"
+BREW_TAG="${HOMEBREW_BREW_GIT_TAG:-7.0.9}"
+BREW_REVISION="${HOMEBREW_BREW_GIT_REVISION:-}"
+BREW_BRANCH="${HOMEBREW_BREW_GIT_BRANCH:-stable}"
+BREW_URL="${HOMEBREW_BREW_GIT_URL:-https://github.com/Homebrew/brew.git}"
 
 # ─── Colors ─────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -24,10 +30,13 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-info()  { echo -e "${GREEN}[homebrew-termux]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[homebrew-termux]${NC} $*"; }
+info() { echo -e "${GREEN}[homebrew-termux]${NC} $*"; }
+warn() { echo -e "${YELLOW}[homebrew-termux]${NC} $*"; }
 error() { echo -e "${RED}[homebrew-termux]${NC} $*" >&2; }
-die()   { error "$*"; exit 1; }
+die() {
+	error "$*"
+	exit 1
+}
 
 # ─── Pre-flight checks ─────────────────────────────────────────────────────
 echo ""
@@ -37,177 +46,119 @@ echo "  ║     Native Homebrew for Termux Android (ARM64)              ║"
 echo "  ╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
-# Check Termux
-[[ -f "${PREFIX}/etc/os-release" ]] || die "Not running in Termux"
+TERMUX_DETECTED=0
+[[ -n "${TERMUX_VERSION:-}" ]] && TERMUX_DETECTED=1
+[[ "${PREFIX}" == "/data/data/com.termux/files/usr" ]] && TERMUX_DETECTED=1
+[[ -d "${GLIBC_PREFIX}" ]] && TERMUX_DETECTED=1
+[[ $TERMUX_DETECTED -eq 0 ]] && die "Not running in Termux"
 
-# Check required tools
 for tool in "$GIT" "$RUBY" "$CURL"; do
-  [[ -x "$tool" ]] || die "Required tool not found: $tool"
+	[[ -x "$tool" ]] || die "Required tool not found: $tool (pkg install git ruby curl)"
 done
 
-# Check glibc
-[[ -x "$GLIBC_BASH" ]] || die "glibc not found at $GLIBC_PREFIX. Install glibc first: pkg install glibc"
+[[ -x "$GLIBC_BASH" ]] || die "glibc not found at $GLIBC_PREFIX (pkg install glibc)"
 [[ -x "$GLIBC_LD" ]] || die "glibc ld-linux not found at $GLIBC_LD"
-
-# Check patchelf
-if [[ ! -x "$PATCHELF" ]]; then
-  warn "patchelf not found at $PATCHELF. Installing..."
-  pkg install -y patchelf 2>/dev/null || die "Failed to install patchelf"
-  PATCHELF="${GLIBC_PREFIX}/bin/patchelf"
-  [[ -x "$PATCHELF" ]] || die "patchelf not available"
-fi
 
 info "Prerequisites OK"
 
 # ─── Create directories ─────────────────────────────────────────────────────
-mkdir -p "$BREW_DIR" "$CACHE_DIR" "$TMP_DIR"
+mkdir -p "$BREW_DIR" "${HOME}/.cache/Homebrew" "$TMP_DIR"
 info "Created directories"
 
-# ─── Clone Homebrew ─────────────────────────────────────────────────────────
+# ─── Clone the pinned Homebrew revision ────────────────────────────────────
+# The patches under ./patches are written against one revision, so the checkout
+# is pinned to a tag and never left tracking a moving branch. Cellar and
+# Caskroom must exist before anything lists installed formulae.
 if [[ -d "${BREW_DIR}/.git" ]]; then
-  info "Homebrew already cloned at $BREW_DIR"
+	info "Homebrew already cloned at $BREW_DIR"
 else
-  info "Cloning Homebrew..."
-  $GIT clone --depth=1 https://github.com/Homebrew/brew.git "$BREW_DIR"
+	info "Cloning Homebrew ${BREW_TAG}..."
+	$GIT clone --depth=1 --branch "$BREW_TAG" "$BREW_URL" "$BREW_DIR"
+	$GIT -C "$BREW_DIR" checkout -q -b "$BREW_BRANCH"
+	$GIT -C "$BREW_DIR" branch --set-upstream-to="refs/tags/${BREW_TAG}" "$BREW_BRANCH"
+fi
+mkdir -p "${BREW_DIR}/Cellar" "${BREW_DIR}/Caskroom"
+
+if [[ -n "$BREW_REVISION" ]]; then
+	actual="$($GIT -C "$BREW_DIR" rev-parse HEAD)"
+	if [[ "$actual" != "$BREW_REVISION" ]]; then
+		warn "Existing checkout is at ${actual:0:12}, expected ${BREW_REVISION:0:12} (${BREW_TAG})."
+		warn "Re-run with a clean checkout (bash uninstall.sh) to pin it."
+	fi
 fi
 
-# ─── Create wrapper scripts ────────────────────────────────────────────────
-info "Creating wrapper scripts..."
+# ─── Copy the patch tooling next to the install ────────────────────────────
+# The git hooks below must keep re-applying the patches even if this repository
+# is gone, so the parts they need are copied out of it once.
+mkdir -p "$REPO_DIR"
+cp -f "${SCRIPT_DIR}/apply-patches.sh" "${SCRIPT_DIR}/config.sh" "$REPO_DIR/"
+rm -rf "${REPO_DIR}/patches"
+cp -R "${SCRIPT_DIR}/patches" "${REPO_DIR}/patches"
+chmod +x "${REPO_DIR}/apply-patches.sh"
+info "Patch tooling installed to $REPO_DIR"
 
-# brew-termux wrapper
-cat > "${BREW_DIR}/bin/brew-termux" << 'WRAPPER'
-#!/data/data/com.termux/files/usr/glibc/bin/bash
-BREW_BIN="$(dirname "$(readlink -f "$0")")"
-BREW_DIR="$(dirname "$BREW_BIN")"
-export HOMEBREW_NO_AUTO_UPDATE=1
-export HOMEBREW_GIT_PATH=/data/data/com.termux/files/usr/bin/git
-export HOMEBREW_TEMP="${HOMEBREW_TEMP:-$HOME/tmp}"
-export HOMEBREW_DEFAULT_TEMP="${HOMEBREW_DEFAULT_TEMP:-$HOME/tmp}"
-mkdir -p "$HOMEBREW_TEMP"
-
-"$BREW_BIN/brew" "$@"
-EXIT_CODE=$?
-
-if [ $EXIT_CODE -eq 0 ] && [[ "$1" == "install" || "$1" == "upgrade" || "$1" == "reinstall" ]]; then
-  PATCHELF=/data/data/com.termux/files/usr/glibc/bin/patchelf
-  GLIBC_LD=/data/data/com.termux/files/usr/glibc/lib/ld-linux-aarch64.so.1
-  GLIBC_LIB=/data/data/com.termux/files/usr/glibc/lib
-  echo "==> Auto-patching ELF binaries..."
-  # rpath must include every Cellar package's own lib/ dir, not just the
-  # global glibc bridge — a binary's own shared lib (e.g. jq -> libjq.so.1)
-  # and its deps' libs (e.g. oniguruma -> libonig.so.5) live under
-  # Cellar/<pkg>/<ver>/lib/, and --set-rpath was overwriting rpath with
-  # only $GLIBC_LIB, so those libs were never found at runtime.
-  CELLAR_LIBS=""
-  for libdir in "$BREW_DIR/Cellar"/*/*/lib; do
-    [ -d "$libdir" ] || continue
-    CELLAR_LIBS="${CELLAR_LIBS}:${libdir}"
-  done
-  FULL_RPATH="${GLIBC_LIB}${CELLAR_LIBS}"
-  for pkg in "$BREW_DIR/Cellar"/*/*/bin/*; do
-    [ -f "$pkg" ] || continue
-    file "$pkg" 2>/dev/null | grep -q "ELF" || continue
-    chmod 755 "$pkg" 2>/dev/null
-    "$PATCHELF" --set-interpreter "$GLIBC_LD" "$pkg" 2>/dev/null
-    "$PATCHELF" --set-rpath "$FULL_RPATH" "$pkg" 2>/dev/null
-  done
-  echo "==> Done patching"
-fi
-exit $EXIT_CODE
+# ─── brew-termux wrapper ───────────────────────────────────────────────────
+# A thin alias for people who do not want ~/brew/bin on PATH. bin/brew already
+# sanitises the environment through its brew-glibc-bash shebang.
+cat >"${BREW_DIR}/bin/brew-termux" <<WRAPPER
+#!/data/data/com.termux/files/usr/bin/bash
+# homebrew-termux: run Homebrew without adding it to PATH.
+exec "${BREW_DIR}/bin/brew" "\$@"
 WRAPPER
 chmod +x "${BREW_DIR}/bin/brew-termux"
 
-# brew-tar wrapper
-cat > "${PREFIX}/bin/brew-tar" << 'TAR'
-#!/data/data/com.termux/files/usr/glibc/bin/bash
-set -e
-TMPDIR="${TMPDIR:-$HOME/tmp}"
-mkdir -p "$TMPDIR"
-ERROR_FILE=$(mktemp "$TMPDIR/tar-errors.XXXXXX")
-if tar "$@" 2>"$ERROR_FILE"; then
-  rm -f "$ERROR_FILE"
-  exit 0
-fi
-TAR_EXIT=$?
-ERROR_OUTPUT=$(cat "$ERROR_FILE" 2>/dev/null)
-rm -f "$ERROR_FILE"
-if echo "$ERROR_OUTPUT" | grep -qE "Invalid cross-device|hard link|Operation not permitted|File exists"; then
-  tar "$@" --overwrite 2>/dev/null || true
-  exit 0
-fi
-echo "$ERROR_OUTPUT" >&2
-exit $TAR_EXIT
-TAR
-chmod +x "${PREFIX}/bin/brew-tar"
-
-# env symlink
-ln -sf "${ENV_BIN}" "${BREW_DIR}/bin/env"
-
-info "Wrapper scripts created"
-
-# ─── Apply patches ──────────────────────────────────────────────────────────
+# ─── Apply the Termux patches ──────────────────────────────────────────────
 info "Applying Termux patches..."
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${SCRIPT_DIR}/apply-patches.sh" ]]; then
-  bash "${SCRIPT_DIR}/apply-patches.sh" "$BREW_DIR"
-elif [[ -f "${HOME}/.homebrew/homebrew-termux/apply-patches.sh" ]]; then
-  bash "${HOME}/.homebrew/homebrew-termux/apply-patches.sh" "$BREW_DIR"
-else
-  die "apply-patches.sh not found"
-fi
+bash "${REPO_DIR}/apply-patches.sh" "$BREW_DIR" --commit
 
-# ─── Install git hooks ──────────────────────────────────────────────────────
+# ─── Install git hooks ─────────────────────────────────────────────────────
+# These re-apply the patches after the operations that rewrite Homebrew's
+# working tree. post-checkout is the one that saves `brew update-reset`, which
+# force-checks-out the repository by design.
 info "Installing git hooks..."
 HOOKS_DIR="${BREW_DIR}/.git/hooks"
 mkdir -p "$HOOKS_DIR"
-
 for hook in post-merge post-checkout post-rewrite; do
-  cat > "${HOOKS_DIR}/${hook}" << HOOK
+	cat >"${HOOKS_DIR}/${hook}" <<HOOK
 #!/data/data/com.termux/files/usr/bin/bash
-exec ~/.homebrew/homebrew-termux/apply-patches.sh ~/brew
+exec "${REPO_DIR}/apply-patches.sh" "${BREW_DIR}" --commit
 HOOK
-  chmod +x "${HOOKS_DIR}/${hook}"
+	chmod +x "${HOOKS_DIR}/${hook}"
 done
-
 info "Git hooks installed"
 
-# ─── Verify installation ────────────────────────────────────────────────────
+# ─── Verify installation ───────────────────────────────────────────────────
 info "Verifying installation..."
 
 if "${BREW_DIR}/bin/brew" --version >/dev/null 2>&1; then
-  VERSION=$("${BREW_DIR}/bin/brew" --version)
-  info "Homebrew version: $VERSION"
+	info "Homebrew version: $("${BREW_DIR}/bin/brew" --version)"
 else
-  die "Homebrew installation failed"
+	die "Homebrew installation failed"
 fi
 
 if "${BREW_DIR}/bin/brew" config >/dev/null 2>&1; then
-  info "Homebrew config OK"
+	info "Homebrew config OK"
 else
-  warn "Homebrew config has warnings (this is normal for Termux)"
+	warn "Homebrew config has warnings (this is normal for Termux)"
 fi
 
 # ─── Add to PATH ────────────────────────────────────────────────────────────
-SHELL_RC=""
-if [[ -f "${HOME}/.bashrc" ]]; then
-  SHELL_RC="${HOME}/.bashrc"
-elif [[ -f "${HOME}/.zshrc" ]]; then
-  SHELL_RC="${HOME}/.zshrc"
-fi
-
-if [[ -n "$SHELL_RC" ]]; then
-  if ! grep -q "homebrew-termux" "$SHELL_RC" 2>/dev/null; then
-    echo "" >> "$SHELL_RC"
-    echo "# homebrew-termux" >> "$SHELL_RC"
-    echo "export PATH=\"${BREW_DIR}/bin:\$PATH\"" >> "$SHELL_RC"
-    info "Added ${BREW_DIR}/bin to PATH in $SHELL_RC"
-  fi
-fi
+for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
+	[[ -f "$rc" ]] || continue
+	if ! grep -q "homebrew-termux" "$rc" 2>/dev/null; then
+		{
+			echo ""
+			echo "# homebrew-termux"
+			echo "export PATH=\"${BREW_DIR}/bin:\$PATH\""
+		} >>"$rc"
+		info "Added ${BREW_DIR}/bin to PATH in $rc"
+	fi
+done
 
 # ─── Done ───────────────────────────────────────────────────────────────────
 echo ""
 echo "  ╔══════════════════════════════════════════════════════════════╗"
-echo "  ║           Installation complete!                            ║"
+echo "  ║           Installation complete!                             ║"
 echo "  ╠══════════════════════════════════════════════════════════════╣"
 echo "  ║                                                              ║"
 echo "  ║  Usage:                                                      ║"
@@ -215,8 +166,8 @@ echo "  ║    brew-termux search <formula>                              ║"
 echo "  ║    brew-termux install <formula>                             ║"
 echo "  ║    brew-termux list                                          ║"
 echo "  ║                                                              ║"
-echo "  ║  Or add to PATH and use 'brew' directly:                    ║"
-echo "  ║    export PATH=\"${BREW_DIR}/bin:\$PATH\"                ║"
+echo "  ║  Or add to PATH and use 'brew' directly:                     ║"
+echo "  ║    export PATH=\"${BREW_DIR}/bin:\$PATH\"                     ║"
 echo "  ║                                                              ║"
 echo "  ╚══════════════════════════════════════════════════════════════╝"
 echo ""

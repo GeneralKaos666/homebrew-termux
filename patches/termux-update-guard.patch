@@ -1,0 +1,51 @@
+diff --git a/Library/Homebrew/cmd/update.sh b/Library/Homebrew/cmd/update.sh
+index 5127022b42..1ef6c53839 100644
+--- a/Library/Homebrew/cmd/update.sh
++++ b/Library/Homebrew/cmd/update.sh
+@@ -251,6 +251,46 @@ merge_or_rebase() {
+   local UPSTREAM_BRANCH
+ 
+   DIR="$1"
++
++  # homebrew-termux: local commits carry the Termux compat patches. The stock
++  # code below force-checkouts/resets the repository, which would silently
++  # discard them. Rebasing is non-destructive: it either succeeds and keeps
++  # both upstream changes and our patches, or fails and is aborted, restoring
++  # exactly the previous state.
++  if [[ -d "/data/data/com.termux/files/usr/glibc" && "${DIR}" == "${HOMEBREW_REPOSITORY}" ]]
++  then
++    cd "${DIR}" || return
++    local termux_upstream_ref
++    termux_upstream_ref="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
++    if [[ -z "${termux_upstream_ref}" ]] || ! git rev-parse --verify -q "${termux_upstream_ref}" &>/dev/null
++    then
++      termux_upstream_ref="origin/${3:-main}"
++      git rev-parse --verify -q "${termux_upstream_ref}" &>/dev/null || termux_upstream_ref=""
++    fi
++    if [[ -n "${termux_upstream_ref}" ]] &&
++       git log --oneline "${termux_upstream_ref}"..HEAD &>/dev/null &&
++       [[ -n "$(git log --oneline "${termux_upstream_ref}"..HEAD 2>/dev/null)" ]]
++    then
++      local termux_pre_rebase_revision
++      termux_pre_rebase_revision="$(read_current_revision)"
++      if git rebase "${termux_upstream_ref}" &>/dev/null
++      then
++        export HOMEBREW_UPDATE_BEFORE"$2"="${termux_pre_rebase_revision}"
++        export HOMEBREW_UPDATE_AFTER"$2"="$(read_current_revision)"
++        # This early return would otherwise skip the HOMEBREW_UPDATED assignment
++        # at the end of the function, so update-report (which gates on it) would
++        # never fire even though the rebase moved HEAD forward.
++        [[ "${termux_pre_rebase_revision}" != "$(read_current_revision)" ]] && HOMEBREW_UPDATED="1"
++      else
++        git rebase --abort &>/dev/null
++        opoo "Skipping self-update of ${DIR}: local Termux compat commits don't rebase cleanly onto ${termux_upstream_ref}."
++        export HOMEBREW_UPDATE_BEFORE"$2"="${termux_pre_rebase_revision}"
++        export HOMEBREW_UPDATE_AFTER"$2"="${termux_pre_rebase_revision}"
++      fi
++      return
++    fi
++  fi
++
+   cd "${DIR}" || return
+   TAP_VAR="$2"
+   UPSTREAM_BRANCH="$3"
