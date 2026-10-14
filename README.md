@@ -2,91 +2,107 @@
 
 Native Homebrew port for Termux Android (ARM64). No proot, no chroot, no containers, no emulation, no root.
 
+Upstream Homebrew is pinned to **7.0.9** (`cdc1ca5`). The compatibility patches are written against that exact revision, so the installer checks out the tag and keeps a local branch (`stable`) on top of it. `brew update`'s Termux guard rebases that branch instead of resetting the repository, so the patches (and the pinned revision) survive.
+
 ## What Works
+
+Verified by `bash test.sh` (18/18) on Termux aarch64:
 
 | Command | Status | Notes |
 |---------|--------|-------|
-| `brew search` | ✅ | Full API search |
-| `brew info` | ✅ | Formula info |
-| `brew install --force-bottle` | ✅ | Bottle installation with auto-patchelf |
-| `brew uninstall` | ✅ | With dependency autoremove |
-| `brew link` / `brew unlink` | ✅ | Symlink management |
-| `brew list --versions` | ✅ | Installed packages |
-| `brew deps` | ✅ | Dependency tree |
-| `brew update` | ✅ | Patches survive via git hooks |
-| `brew upgrade` | ✅ | Package upgrades |
-| `brew tap` | ✅ | Tap management |
-| `brew bundle --help` | ✅ | Bundle help |
-| `brew create --help` | ✅ | Create help |
-| `brew edit --help` | ✅ | Edit help |
+| `brew --version` / `--help` / `config` | ✅ | |
+| `brew search` / `brew info` | ✅ | formulae.brew.sh JSON API, no tap clone |
+| `brew install --force-bottle` | ✅ | The pinned `arm64_linux` bottle pours and runs as-is |
+| `brew reinstall --force-bottle` | ✅ | |
+| `brew uninstall` | ✅ | |
+| `brew link` / `brew unlink` | ✅ | |
+| `brew list --versions` | ✅ | |
+| `brew update` | ✅ | Local patch commit preserved |
+| `brew upgrade` | ✅ | |
+| `brew tap` | ✅ | |
+| `brew update-reset` | ✅ | Destructive by design; re-applies the patches itself |
+
+Installed bottles run directly. There is no post-install `patchelf` step: Homebrew's own `symlink_ld_so` points `$HOMEBREW_PREFIX/lib/ld.so` at Termux's glibc loader, so poured binaries already have the right interpreter and RPATH (see *How It Works*).
+
+## How It Works
+
+1. **glibc loader bridge.** Homebrew bottles are built against glibc; Termux is Bionic. `patches/termux-structural.patch` prepends `$PREFIX/glibc/lib/ld-linux-*.so.*` to `OS::Linux::LD::DYNAMIC_LINKERS` (arm, arm64, i386, x86_64), ahead of `/system/bin/linker*`. Homebrew then creates `$HOMEBREW_PREFIX/lib/ld.so` → glibc loader, and every poured binary is left with that interpreter plus an RPATH into the Cellar and `$HOMEBREW_PREFIX/lib`.
+
+2. **Sanitised entry point.** Termux exports `LD_PRELOAD`/`LD_LIBRARY_PATH` pointing at Bionic libraries; a glibc process started with those set resolves Bionic's `libc.so` (a linker script, not an ELF object) and aborts. `apply-patches.sh` writes `$BREW/bin/brew-glibc-bash`, which clears those variables, sets `TMPDIR`, `HOMEBREW_SPAWN_SYSTEM` and `HOMEBREW_NO_RELOCATE_BUILD_PREFIX`, then `exec`s the glibc loader with glibc bash. `bin/brew`'s shebang points at it.
+
+3. **Fork avoidance.** Android's kernel blocks `pthread_rwlock_unlock` in forked children, which crashes Ruby's `fork`-based spawn paths. The patch replaces those with `Process.spawn`, and `utils/popen.rb` uses the spawn path (`Homebrew.termux?` or `HOMEBREW_SPAWN_SYSTEM=1`).
+
+4. **Hard links.** Android's app-data (FUSE) filesystem cannot create hard links, but bottles contain them. `$PREFIX/bin/brew-tar` wraps `tar`, tolerates the hard-link error class, and still reports any other failure.
+
+5. **Path redirection.** Hardcoded FHS paths are rewritten to Termux equivalents: `/usr/bin/env`, `/bin/bash`, `/usr/bin/ldd`, `/usr/bin/stat`, `/usr/bin/tput`, `/etc/os-release`. `HOMEBREW_DEFAULT_TEMP` becomes `$PREFIX/tmp` (Android has no writable `/tmp` or `/var/tmp`) and `LC_ALL=C.UTF-8` is forced, because Termux ships no `locale` binary and `LC_ALL=C` makes Ruby parse JSON as US-ASCII.
+
+6. **Patch persistence.** Two mechanisms, because neither covers everything:
+   - `brew update` — `patches/termux-update-guard.patch` makes `cmd/update.sh` rebase the local branch onto the pinned tag instead of force-resetting it. If the rebase conflicts it aborts and skips the self-update with a warning, leaving the repository exactly as it was.
+   - `brew update-reset` — this command is destructive by design and runs git with `core.hooksPath=/dev/null`, so a git hook **cannot** cover it. The patch adds a step to its own function that calls `apply-patches.sh` back (its path is recorded in the checkout's local git config) once the reset is done.
+   - Belt and braces: `post-merge`, `post-checkout` and `post-rewrite` hooks in `$BREW/.git/hooks` also re-run `apply-patches.sh`.
+
+## Patches
+
+The patches target the pinned revision exactly. Every upstream edit lives in a maintained patch so the result is byte-exact and reproducible:
+
+| File | Contents |
+|------|----------|
+| `patches/termux-structural.patch` | All 16 upstream source edits: Termux detection, the glibc loader bridge, fork-free spawning, FHS path redirection, temp dir and locale, the `brew update-reset` re-apply step, and accepting longer-prefix bottles |
+| `patches/termux-update-guard.patch` | `Library/Homebrew/cmd/update.sh` only: rebase instead of reset |
+
+Two edits are **not** in the patches, because a static patch cannot carry them, and `apply-patches.sh` makes them with marker-guarded `sed` instead:
+
+- `bin/brew` — its shebang embeds this checkout's absolute path (the `brew-glibc-bash` runner), plus a Termux-safe `PATH` and the `env`/`bash` exec paths.
+- `$PREFIX/bin/brew-tar` — a new file that lives outside the repository.
+
+`apply-patches.sh` is idempotent: it uses `git apply`'s own reverse-apply check to decide whether a patch is already in the tree, so re-running it applies nothing. If a patch neither applies nor reverse-applies (wrong revision, or an older patch version is installed), it stops with a clear message instead of committing a half-patched tree.
+
+### Changing the patches
+
+Bump the tag and revision in `config.sh` together, regenerate the patches against the new revision, and re-run `bash install.sh`. Because the patches are versioned as a whole, an existing install is not upgraded in place — `apply-patches.sh` will refuse rather than half-apply. Use `bash uninstall.sh && bash install.sh`.
 
 ## Known Limitations
 
-- **Bubblewrap sandbox**: Disabled on Termux (no unprivileged user namespaces)
-- **Prefix mismatch**: Bottles built for `/home/linuxbrew/.linuxbrew` work via `--force-bottle`
-- **ELF patching**: All binaries must be patched with patchelf to use glibc linker
-- **`brew update-reset`**: destructive by design (hard-resets `Library/Homebrew` to upstream for every user) — a `post-checkout` git hook (`$HOMEBREW_REPOSITORY/.git/hooks/post-checkout`, not tracked by git so it survives the reset) auto-reapplies and recommits the patch after it
-
-## `--build-from-source` (verified working)
-
-`patches/build-from-source-fixes.patch` (apply with `git apply` from `$HOMEBREW_REPOSITORY`, then `git commit` so `brew update`'s guard recognizes it as intentional) fixes the from-source build path end to end — `git` and `cmake` built and ran successfully with it applied:
-
-- GCC `-idirafter` vs `-isystem` ordering (fixes libstdc++'s `#include_next` chain finding real headers)
-- `-std=gnu17`/`gnu89` fallback so this GCC's default C standard doesn't reject C99 mid-block declarations (git) or ancient K&R code (cyrus-sasl)
-- `-rpath-link` to the glibc bridge (fixes indirect-dependency link failures, e.g. krb5 needing `libresolv`)
-- `CMAKE_LIBRARY_PATH`/`CMAKE_INCLUDE_PATH` set directly on `ENV` in `build.rb` (Superenv strips shell-level exports, so `.zshrc`-level env vars never reach the build)
-- `bin/brew`, `os.sh`, `vendor-install.sh`, `list.sh`, `executables.sh`, `update.sh`, shared `curl`/`git` shims, `system_command.rb`: every remaining hardcoded `/usr/bin/env`, `/usr/bin/ldd`, `/usr/bin/stat`, `/etc/os-release`, `/bin/bash` replaced with the real Termux/bridge path
-- `os/linux/glibc.rb`: **root cause** of a nasty cascade — `Glibc.system_version` shelled out to a hardcoded `/usr/bin/ldd` that doesn't exist, silently returned a null version, which made Homebrew think glibc was "too old" and auto-add `glibc`+`linux-headers` as a forced from-source dependency for *any* formula, and also broke `DevelopmentTools.locate` into reporting "No developer tools installed" even with a working from-source GCC installed
-- `cmd/doctor.rb`: fixed a `max_by` crash comparing `Symbol` vs `Integer` tiers (hit by any non-default/Tier-3 prefix, which this always is)
-- `LC_ALL=C.UTF-8` forced in `os.sh` instead of falling back to `C` (Termux has no `locale` binary), since `LC_ALL=C` makes Ruby's external encoding US-ASCII and `JSON.parse` crashes on the first non-ASCII byte in a formula description
-- `HOMEBREW_UPDATED` now gets set when the rebase-fallback actually moves `HEAD` forward, so `brew update`'s changelog/update-report still fires (previously the early return skipped it silently)
-- rpath no longer grows unbounded across repeated `vendor-install` runs (retries, reinstalls) — checks whether the glibc lib dir is already present before appending
-- `grep -qa` instead of `-q` for the ELF magic-byte check (some `grep` builds, e.g. toybox, otherwise treat it as a binary file and skip it)
-- arm/i686 loader paths added alongside aarch64/x86_64 (Termux officially only ships aarch64/x86_64 today, but costs nothing to cover)
+- **`--force-bottle` is required.** The pinned bottles are built at `/home/linuxbrew/.linuxbrew` and their Cellar path is shorter than Termux's, so Homebrew does not consider them relocatable. Without the flag it falls back to a source build.
+- **Build-prefix relocation is skipped.** Termux's prefix is longer than the Linux bottle prefix, and Homebrew relocates raw binary C strings in place only to an equal-or-shorter prefix. The runner sets `HOMEBREW_NO_RELOCATE_BUILD_PREFIX=1`, so those strings stay stale (cosmetic, e.g. an embedded `localedir`). Placeholdered text and RPATH/interpreter relocation are length-independent and still run, so binaries work.
+- **Building from source is not supported.** These patches cover the bottle path only; the earlier `build-from-source-fixes.patch` has been removed.
+- **Bubblewrap sandbox is disabled** (Android has no unprivileged user namespaces).
+- **`brew update` does not move off the pinned tag.** That is intentional: the patches are revision-specific.
 
 ## Architecture
 
 ```
 Termux (Android ARM64)
-├── $PREFIX/glibc/          # GNU C Library
+├── $PREFIX/glibc/            # GNU C Library (pkg: glibc-runner)
 │   ├── lib/ld-linux-aarch64.so.1
-│   └── bin/bash, env, patchelf
-├── $PREFIX/bin/ruby        # Ruby 3.4.1
-├── $PREFIX/bin/git         # Git 2.55.0
-└── ~/brew/                 # Homebrew
-    ├── bin/brew            # Original brew
-    ├── bin/brew-termux     # Wrapper with auto-patchelf
-    ├── bin/env -> glibc env
-    ├── Cellar/             # Installed packages
-    └── Library/Homebrew/   # Patched source
+│   └── bin/{bash,ldd,patchelf}
+├── $PREFIX/bin/{ruby,git,curl,tar,stat,env,tput}
+├── $PREFIX/bin/brew-tar      # hard-link-tolerant tar wrapper (generated)
+└── ~/brew/                   # Homebrew checkout (HOMEBREW_REPOSITORY)
+    ├── bin/brew              # shebang -> bin/brew-glibc-bash
+    ├── bin/brew-glibc-bash   # sanitised glibc entry point (generated)
+    ├── bin/brew-termux       # convenience wrapper
+    ├── lib/ld.so -> $PREFIX/glibc/lib/ld-linux-aarch64.so.1
+    ├── Cellar/               # installed packages
+    └── Library/Homebrew/     # patched source (committed locally)
 ```
-
-## How It Works
-
-1. **Fork avoidance**: Android kernel blocks `pthread_rwlock_unlock` in forked processes. All `fork()` calls are replaced with `Process.spawn()`.
-
-2. **glibc compatibility**: Homebrew bottles are built against glibc. Termux uses Bionic. The `patchelf` tool rewrites ELF binaries to use Termux's glibc linker and libraries.
-
-3. **Hard-link fix**: Android's FUSE filesystem doesn't support hard links. The `brew-tar` wrapper handles this gracefully.
-
-4. **Path redirection**: All references to `/bin/bash`, `/usr/bin/env`, `/usr/bin/ldd` are redirected to Termux equivalents.
-
-5. **Patch persistence**: `cmd/update.sh` tries `git rebase` onto the new upstream first (keeps both upstream changes and local Termux commits); only skips the self-update, with a warning, if that rebase conflicts — it doesn't freeze `Library/Homebrew` forever. `brew update-reset` bypasses this (destructive by design, hard-resets to upstream), but a `post-checkout` git hook auto-reapplies and recommits the patch afterward, so no manual step is needed.
 
 ## Installation
 
 ```bash
-# Prerequisites
-pkg install git ruby patchelf
+# Prerequisites: glibc-runner brings glibc, glibc bash and patchelf-glibc
+pkg install git ruby curl glibc-runner
 
-# Install
-bash <(curl -fsSL https://raw.githubusercontent.com/user/homebrew-termux/main/install.sh)
+# Install (clones Homebrew 7.0.9 into ~/brew, patches it, installs the hooks)
+bash <(curl -fsSL https://raw.githubusercontent.com/rianprei/homebrew-termux/main/install.sh)
 
 # Or clone and install
-git clone https://github.com/user/homebrew-termux.git
+git clone https://github.com/rianprei/homebrew-termux.git
 cd homebrew-termux
 bash install.sh
 ```
+
+The installer copies `apply-patches.sh`, `config.sh` and `patches/` to `~/.homebrew/homebrew-termux/` so the git hooks keep working even if this repository is removed, and adds `~/brew/bin` to `.bashrc`/`.zshrc`.
 
 ## Usage
 
@@ -96,49 +112,43 @@ brew-termux search wget
 brew-termux install wget
 brew-termux list
 
-# Or add to PATH
+# Or add ~/brew/bin to PATH and use brew directly
 export PATH="$HOME/brew/bin:$PATH"
-brew search wget
+brew install --force-bottle wget
 ```
 
 ## Uninstall
 
 ```bash
-bash ~/homebrew-termux/uninstall.sh
+bash uninstall.sh
 ```
+
+Removes `~/brew`, `~/.homebrew`, `~/.cache/Homebrew`, `$PREFIX/bin/brew-tar` and the `PATH` lines the installer added.
 
 ## Testing
 
 ```bash
-bash ~/homebrew-termux/test.sh
+bash test.sh
 ```
 
-## How Patches Work
-
-`patches/build-from-source-fixes.patch` is applied with plain `git apply` against `$HOMEBREW_REPOSITORY`, then committed locally (`git commit`) — this is what `cmd/update.sh`'s guard checks for to know it should try rebasing instead of resetting.
-
-For the one path that guard doesn't cover (`brew update-reset`, which force-checks-out origin/HEAD), `$HOMEBREW_REPOSITORY/.git/hooks/post-checkout` re-applies and recommits the patch automatically. It's a no-op (exit 0, does nothing) if the patch is already applied.
+Runs 18 checks against `~/brew` end to end (basic commands, search/info, bottle install, ELF/interpreter/RPATH validation and execution of `hello`, link/unlink, reinstall, uninstall, update/upgrade, tap).
 
 ## ELF Binary Validation
 
 After installing a package, validate the binary:
 
 ```bash
-# Check file type
 file ~/brew/Cellar/hello/2.12.3/bin/hello
-# Expected: ELF 64-bit LSB pie executable, ARM aarch64
+# ELF 64-bit LSB pie executable, ARM aarch64
 
-# Check interpreter
 readelf -l ~/brew/Cellar/hello/2.12.3/bin/hello | grep interpreter
-# Expected: interpreter: /data/data/com.termux/files/usr/glibc/lib/ld-linux-aarch64.so.1
+# [Requesting program interpreter: /data/data/com.termux/files/home/brew/lib/ld.so]
 
-# Check dependencies
 readelf -d ~/brew/Cellar/hello/2.12.3/bin/hello | grep NEEDED
-# Expected: libc.so.6 (glibc, not bionic)
+# Shared library: [libc.so.6]      (glibc, not bionic)
 
-# Run the binary
 hello
-# Expected: Hello, world!
+# Hello, world!
 ```
 
 ## Contributing
@@ -146,7 +156,7 @@ hello
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Run tests: `bash test.sh`
+4. Run `bash test.sh`
 5. Submit a pull request
 
 ## License
